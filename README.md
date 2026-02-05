@@ -1,6 +1,6 @@
 # klipper4cnc
 
-> A CNC-capable fork of Klipper with a geometry-first motion pipeline - Very much incomplete but I will be actively developing it. I'm sure I have a few more weeks of coding before testing with an actual cnc.
+A CNC-capable fork of Klipper with a geometry-first motion pipeline - Very much incomplete but I will be actively developing it. I'm sure I have a few more weeks of coding before testing with an actual cnc.
 
 **klipper4cnc** is a fork of [Klipper](https://github.com/Klipper3d/klipper) that adds a true CNC execution mode while preserving full compatibility with traditional 3D printer usage.
 
