@@ -10,6 +10,14 @@ class CNCInterpreter:
         self.state = modal_state
         self.soft_limits = soft_limits
 
+    def apply_work_offset(self, position):
+        ox, oy, oz = self.state.work_offsets[self.state.active_wcs]
+        return (
+            position[0] + ox,
+            position[1] + oy,
+            position[2] + oz,
+        )
+
     def interpret(self, parsed):
         """
         Interpret parsed G-code data and return motion primitives.
@@ -44,11 +52,15 @@ class CNCInterpreter:
                 self.state.update_feedrate(value)
 
         # --- Generate motion primitives ---
-        if self.state.motion_mode and target:
-            start = tuple(self.state.position)
-            end = self.state.resolve_target(target)
+            # Program-space positions
+            start_prog = tuple(self.state.position)
+            end_prog = self.state.resolve_target(target)
 
-            # ---------------- ARC MOTION ----------------
+            # Apply work coordinate offset (program → machine space)
+            start = self.apply_work_offset(start_prog)
+            end = self.apply_work_offset(end_prog)
+
+        # ---------------- ARC MOTION ----------------
             if self.state.motion_mode in (MotionType.ARC_CW, MotionType.ARC_CCW):
                 plane = self.state.plane
                 pos = start
@@ -71,11 +83,11 @@ class CNCInterpreter:
 
                 # --- Determine arc center ---
                 if "R" in target:
-                    from arc import arc_center_from_radius
-                    center = arc_center_from_radius(
+                    from arc import compute_arc_center_from_r
+                    center = compute_arc_center_from_r(
                         start=(a0, b0),
                         end=(a1, b1),
-                        radius=target["R"] * self.state.units_scale,
+                        r=target["R"] * self.state.units_scale,
                         clockwise=(self.state.motion_mode == MotionType.ARC_CW),
                     )
                 else:

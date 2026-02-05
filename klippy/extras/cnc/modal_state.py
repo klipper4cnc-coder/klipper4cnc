@@ -16,8 +16,15 @@ class CNCModalState:
         # Feedrate (mm/min)
         self.feedrate = 1000 # default but can change
 
-        # Coordinate system
-        self.work_offset = (0.0, 0.0, 0.0)  # G54 only for now
+        self.active_wcs = 'G54'
+        self.work_offsets = {
+            'G54': (0.0, 0.0, 0.0),
+            'G55': (0.0, 0.0, 0.0),
+            'G56': (0.0, 0.0, 0.0),
+            'G57': (0.0, 0.0, 0.0),
+            'G58': (0.0, 0.0, 0.0),
+            'G59': (0.0, 0.0, 0.0),
+        }
 
         # Current position (machine space)
         self.position = [0.0, 0.0, 0.0]
