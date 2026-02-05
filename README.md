@@ -1,7 +1,6 @@
 # klipper4cnc
 
-> A CNC-capable fork of Klipper with a geometry-first motion pipeline
-
+> A CNC-capable fork of Klipper with a geometry-first motion pipeline - Very much incomplete but I will be actively developing it. I'm sure I have a few more weeks of coding before testing with an actual cnc.
 **klipper4cnc** is a fork of [Klipper](https://github.com/Klipper3d/klipper) that adds a true CNC execution mode while preserving full compatibility with traditional 3D printer usage.
 
 The goal is **not** to turn Klipper into “kind-of CNC”, but to allow Klipper to operate in **two distinct motion personalities**:
@@ -195,7 +194,7 @@ See the `COPYING` file for details.
 
 ## Disclaimer
 
-This project can move real hardware.
+This project can move real hardware. (Not yet, but it will soon)
 
 **Use at your own risk.**  
 Do not run on machines without proper safety measures.
@@ -212,4 +211,3 @@ Contributions, discussion, and design review are welcome — especially around:
 - Testing strategies
 
 This project values **clarity and correctness over speed**.
-
