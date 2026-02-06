@@ -3,7 +3,7 @@
 from primitives import MotionPrimitive, MotionType
 from arc import segment_arc, compute_arc_center_from_r
 from limits import SoftLimits, SoftLimitError
-
+from linear import segment_linear
 
 class CNCInterpreter:
     def __init__(self, modal_state, soft_limits=None):
@@ -154,27 +154,26 @@ class CNCInterpreter:
 
                     prev = tuple(next_pt)
 
+
+
             # ---------------- LINEAR / RAPID ----------------
             else:
-                primitives.append(
-                    MotionPrimitive(
-                        motion=self.state.motion_mode,
-                        start=start,
-                        end=end,
-                        feedrate=self.state.feedrate,
-                    )
+                segments = segment_linear(
+                    start=start,
+                    end=end,
+                    feedrate=self.state.feedrate,
+                    max_segment_time=self.state.max_segment_time,
                 )
 
-            self.state.position = list(end)
-
-        # --- Soft limit validation ---
-        validated = []
-        for p in primitives:
-            if self.soft_limits:
-                self.soft_limits.check_primitive(p)
-            validated.append(p)
-
-        return validated
+                for seg_start, seg_end in segments:
+                    primitives.append(
+                        MotionPrimitive(
+                            motion=self.state.motion_mode,
+                            start=seg_start,
+                            end=seg_end,
+                            feedrate=self.state.feedrate,
+                        )
+                    )
 
     def _handle_g(self, gcode):
         if gcode in (0, 1):
@@ -195,3 +194,14 @@ class CNCInterpreter:
 
         elif gcode in (17, 18, 19):
             self.state.set_plane(f"G{gcode}")
+
+
+def test_linear_segmentation_time_bound():
+    segs = segment_linear(
+        (0,0,0), (100,0,0), feedrate=600, max_segment_time=0.1
+    )
+    assert len(segs) >= 10
+    return segs
+
+
+print(test_linear_segmentation_time_bound())
