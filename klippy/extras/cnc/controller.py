@@ -4,6 +4,9 @@ from enum import Enum
 from collections import deque
 from parser import parse_gcode_line
 
+# New: streaming planner (raw MotionPrimitive -> PlannedPrimitive)
+from planner import CNCPlanner, PlannedPrimitive
+
 
 def format_time(seconds):
     """
@@ -46,25 +49,34 @@ class CNCController:
     Responsibilities:
     - Stream G-code from a source (via streamer)
     - Convert G-code lines into motion primitives
-    - Maintain a lookahead buffer
+    - Maintain a planned lookahead queue (PlannedPrimitive)
     - Execute motion primitives one at a time
     - Handle feed hold, resume, cancel, and reset
     - Track progress and estimate remaining time
     """
 
-    def __init__(self, executor, program=None):
+    def __init__(self, executor, program=None, planner: CNCPlanner = None):
         # Motion executor (e.g. KlipperMotionExecutor)
         self.executor = executor
 
         # Program object (may be None in streaming mode)
         self.program = program
 
+        # Streaming planner (required for accel/JD lookahead)
+        # If you want to keep legacy behavior, you can pass planner=None and it will
+        # fall back to the old raw primitive buffer mode (see below).
+        self.planner = planner
+
         # Current controller state
         self.state = ControllerState.IDLE
 
-        # Lookahead buffer for motion primitives
-        self.buffer = deque()
-        self.lookahead_size = 20
+        # Planned queue feeding executor
+        # (In legacy mode, we use self.buffer instead)
+        self.ready_queue = deque()   # deque[PlannedPrimitive]
+        self.lookahead_size = 20     # number of planned moves to keep ready
+
+        # Legacy raw buffer (used only if planner is None)
+        self.buffer = deque()        # deque[MotionPrimitive]
 
         # End-of-file flag for streaming mode
         self.eof = False
@@ -93,7 +105,8 @@ class CNCController:
         This method:
         - Reads G-code lines incrementally from the streamer
         - Parses and interprets them into motion primitives
-        - Maintains a lookahead buffer
+        - Feeds primitives into a streaming planner (if present)
+        - Maintains a planned lookahead queue
         - Executes primitives as long as the controller is RUNNING
         """
         print("[DBG] run_stream entered")
@@ -106,30 +119,41 @@ class CNCController:
                     print("[DBG] cancelled")
                     break
 
-                # ---- FILL LOOKAHEAD BUFFER ----
-                while not self.eof and len(self.buffer) < self.lookahead_size:
-                    line = streamer.next_line()
+                # ---- FILL LOOKAHEAD ----
+                if self.planner is None:
+                    # Legacy mode: fill raw primitive buffer
+                    while not self.eof and len(self.buffer) < self.lookahead_size:
+                        line = streamer.next_line()
 
-                    if line is None:
-                        # No more input from streamer
-                        self.eof = True
-                        print("[DBG] EOF reached")
-                        break
+                        if line is None:
+                            self.eof = True
+                            print("[DBG] EOF reached")
+                            break
 
-                    # Parse raw G-code line into words
-                    words = parse_gcode_line(line)
+                        words = parse_gcode_line(line)
+                        primitives = interpreter.interpret(words)
+                        for p in primitives:
+                            self.buffer.append(p)
+                else:
+                    # Planned mode: fill planned queue
+                    # (Keep reading until we have enough *planned* moves ready to execute)
+                    while not self.eof and len(self.ready_queue) < self.lookahead_size:
+                        line = streamer.next_line()
 
-                    # Interpret words into motion primitives
-                    primitives = interpreter.interpret(words)
+                        if line is None:
+                            # No more input: finalize planner and push remaining planned moves
+                            self.eof = True
+                            print("[DBG] EOF reached")
+                            self.ready_queue.extend(self.planner.finish())
+                            break
 
-                    for p in primitives:
-                        self.buffer.append(p)
-                        # ❌ IMPORTANT:
-                        # Do NOT modify total_length or progress here.
-                        # Length tracking is handled elsewhere and must
-                        # remain consistent during streaming.
-                        # self.total_units += 1
-                        # self.total_length += p.length()
+                        words = parse_gcode_line(line)
+                        primitives = interpreter.interpret(words)
+
+                        for p in primitives:
+                            committed = self.planner.push(p)
+                            if committed:
+                                self.ready_queue.extend(committed)
 
                 # ---- HOLD ----
                 # If not actively running, do not execute motion
@@ -141,10 +165,16 @@ class CNCController:
 
                 # ---- TERMINATION CONDITION ----
                 if not did_step:
-                    # End when no more data AND buffer is empty
-                    if self.eof and not self.buffer:
-                        print("[CTRL] job complete")
-                        break
+                    if self.planner is None:
+                        # End when no more data AND raw buffer is empty
+                        if self.eof and not self.buffer:
+                            print("[CTRL] job complete")
+                            break
+                    else:
+                        # End when no more data AND planned queue is empty
+                        if self.eof and not self.ready_queue:
+                            print("[CTRL] job complete")
+                            break
 
         finally:
             streamer.close()
@@ -186,7 +216,16 @@ class CNCController:
         Reset controller state and clear all execution buffers.
         """
         self.state = ControllerState.IDLE
+
+        # Clear buffers
         self.buffer.clear()
+        self.ready_queue.clear()
+
+        # Reset planner
+        if self.planner is not None:
+            self.planner.reset()
+
+        # Reset stream state / progress
         self.eof = False
         self.total_length = 0.0
         self.completed_length = 0.0
@@ -207,19 +246,38 @@ class CNCController:
 
     def step(self):
         """
-        Execute a single motion primitive from the lookahead buffer.
+        Execute a single motion primitive from the lookahead queue/buffer.
 
         :return: True if a step was executed, False otherwise
         """
         if self.state != ControllerState.RUNNING:
             return False
 
-        if not self.buffer:
+        # ---- Legacy mode ----
+        if self.planner is None:
+            if not self.buffer:
+                return False
+
+            p = self.buffer.popleft()
+            return self._execute_primitive(p)
+
+        # ---- Planned mode ----
+        if not self.ready_queue:
             return False
 
-        # Pop next motion primitive
-        p = self.buffer.popleft()
+        item = self.ready_queue.popleft()
+        if isinstance(item, PlannedPrimitive):
+            p = item.primitive
+        else:
+            # Safety: in case something non-planned was queued
+            p = item
 
+        return self._execute_primitive(p)
+
+    def _execute_primitive(self, p):
+        """
+        Execute a MotionPrimitive and update progress.
+        """
         # Feedrate must be fully resolved by execution time
         if p.feedrate is None:
             raise RuntimeError(
@@ -227,7 +285,7 @@ class CNCController:
                 f"(pos={p.start} → {p.end}, mode={p.motion})"
             )
 
-        # Send motion to the executor (Klipper)
+        # Send motion to the executor (Klipper backend or mock)
         self.executor.execute(p)
 
         # Update completed motion length
@@ -235,7 +293,6 @@ class CNCController:
 
         # Report progress every fixed distance of actual motion
         REPORT_STEP = 10.0  # mm
-
         if self.completed_length - self._last_reported >= REPORT_STEP:
             self._last_reported = self.completed_length
             self.report_progress()
@@ -256,7 +313,8 @@ class CNCController:
         pct = (self.completed_length / self.total_length) * 100.0
         remaining_len = max(self.total_length - self.completed_length, 0.0)
 
-        # Feedrate is tracked by the executor
+        # Feedrate is tracked by the executor (optional).
+        # If your executor doesn't provide this, ETA will be '?'.
         feed = getattr(self.executor, "last_feedrate", None)
 
         if feed and feed > 0:
@@ -265,10 +323,7 @@ class CNCController:
         else:
             eta = "?"
 
-        print(
-            f"[PROGRESS] "
-            f"{pct:.1f}% | ETA {eta}"
-        )
+        print(f"[PROGRESS] {pct:.1f}% | ETA {eta}")
 
     def flush(self):
         """
