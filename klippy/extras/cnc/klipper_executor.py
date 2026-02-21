@@ -1,49 +1,45 @@
 # klippy/extras/cnc/klipper_executor.py
 
-from executor import MotionExecutor
+try:
+    from .executor import MotionExecutor
+except ImportError:
+    from executor import MotionExecutor
 
 
 class KlipperMotionExecutor(MotionExecutor):
-    """
-    MotionExecutor implementation backed by Klipper's toolhead.
-
-    This class translates fully-resolved MotionPrimitive objects
-    into Klipper toolhead moves.
-    """
-
     def __init__(self, printer):
-        # Reference to Klipper's printer object
         self.printer = printer
-
-        # Toolhead object used to queue motion
         self.toolhead = printer.lookup_object("toolhead")
 
     def execute(self, primitive):
-        """
-        Execute a single motion primitive using Klipper.
-
-        Motion primitives are expected to:
-        - Be in absolute machine coordinates
-        - Have a resolved feedrate (mm/min)
-        """
-
-        # Convert feedrate from mm/min (CNC) to mm/s (Klipper)
+        # Feedrate is in units/min (mm/min). Klipper expects speed in mm/s.
         if primitive.feedrate is None:
-            speed = None
-        else:
-            speed = primitive.feedrate / 60.0
+            raise ValueError("Primitive has no feedrate; cannot execute on toolhead")
+        speed = primitive.feedrate / 60.0
 
-        # Klipper expects absolute XYZ positions
         x, y, z = primitive.end
 
-        # Queue the move with the toolhead
-        self.toolhead.move(
-            [x, y, z],
-            speed
-        )
+        # Preserve E axis (toolhead uses 4-axis commanded_pos)
+        curpos = list(self.toolhead.get_position())
+        if len(curpos) < 4:
+            # Extremely defensive; toolhead should always be 4.
+            curpos = (curpos + [0.0, 0.0, 0.0, 0.0])[:4]
+        newpos = curpos[:]
+        newpos[0], newpos[1], newpos[2] = x, y, z
+
+        self.toolhead.move(newpos, speed)
+
+    def buffer_time(self, eventtime):
+        # Approximate queued motion time remaining in toolhead.
+        # This is how you keep HOLD/CANCEL responsive by not over-buffering.
+        mcu = getattr(self.toolhead, "mcu", None)
+        if mcu is None:
+            return 0.0
+        est = mcu.estimated_print_time(eventtime)
+        last = self.toolhead.get_last_move_time()
+        return max(0.0, last - est)
 
     def flush(self):
-        """
-        Block until all queued toolhead motion has completed.
-        """
+        # Avoid calling wait_moves() from a timer-driven runner.
+        # Keep this for legacy/manual usage only.
         self.toolhead.wait_moves()

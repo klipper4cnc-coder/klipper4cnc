@@ -1,152 +1,94 @@
 # klippy/extras/cnc/modal_state.py
 
+try:
+    from .primitives import MotionType
+except ImportError:
+    from primitives import MotionType
+
 
 class CNCModalState:
     """
-    Holds modal CNC state across G-code lines.
-
-    Modal state persists until explicitly changed by a G-code command.
-    This includes units, distance mode, plane selection, feedrate,
-    coordinate systems, and current position.
+    CNC modal state across G-code lines.
+    Stores *program-space* XYZ in mm (units scaling applied on input).
+    Work offsets are applied separately when generating machine-space primitives.
     """
 
     def __init__(self):
-        # -------------------------
-        # Units
-        # -------------------------
+        self.reset()
 
-        # Active units ("mm" or "inch")
-        self.units = "mm"          # G21 / G20
-
-        # Scale factor to convert program units to millimeters
-        self.units_scale = 1.0     # mm
-
-        # -------------------------
-        # Distance mode
-        # -------------------------
-
-        # Absolute (G90) or incremental (G91) positioning
-        self.absolute = True       # G90 / G91
-
-        # -------------------------
-        # Motion plane
-        # -------------------------
-
-        # Active motion plane for arc commands
-        # Default is XY plane per CNC spec
-#        self.plane = "XY"          # G17 (XY only for now)
-        self.plane = Plane.XY      # default per spec
-
-        # -------------------------
-        # Feedrate
-        # -------------------------
-
-        # Active feedrate in mm/min
-        self.feedrate = 1000       # default but can change
-
-        # -------------------------
-        # Work coordinate systems
-        # -------------------------
-
-        # Active work coordinate system (G54–G59)
-        self.active_wcs = 'G54'
-
-        # Offsets for each work coordinate system
-        self.work_offsets = {
-            'G54': (0.0, 0.0, 0.0),
-            'G55': (0.0, 0.0, 0.0),
-            'G56': (0.0, 0.0, 0.0),
-            'G57': (0.0, 0.0, 0.0),
-            'G58': (0.0, 0.0, 0.0),
-            'G59': (0.0, 0.0, 0.0),
-        }
-
-        # -------------------------
-        # Position tracking
-        # -------------------------
-
-        # Current machine-space position
+    def reset(self):
+        # Program-space position (mm), without WCS applied
         self.position = [0.0, 0.0, 0.0]
 
-        # -------------------------
-        # Motion mode
-        # -------------------------
+        # G90/G91
+        self.absolute = True
 
-        # Active motion mode (G0 / G1 / G2 / G3)
-        self.motion_mode = None
+        # Current feedrate (mm/min). For G1/G2/G3 this must be set.
+        self.feedrate = None
 
-        # -------------------------
-        # Arc settings
-        # -------------------------
+        # G0/G1/G2/G3
+        self.motion_mode = MotionType.RAPID
 
-        # Maximum allowed chordal deviation when segmenting arcs
-        self.arc_tolerance = 0.01  # mm
+        # G17/G18/G19 stored as string (interpreter compares strings)
+        self.plane = "G17"
 
-        # NOTE: tolerance is overridden in test_file.py
+        # G20/G21
+        self.units = "mm"
+        self.units_scale = 1.0  # multiply incoming words by this to get mm
 
-    def set_units(self, gcode):
-        """
-        Set active units based on G-code.
-        """
-        if gcode == "G20":
-            self.units = "inch"
-            self.units_scale = 25.4
-        elif gcode == "G21":
-            self.units = "mm"
-            self.units_scale = 1.0
+        # Work coordinate system selection (G54..G59 -> 0..5)
+        self.active_wcs = 0
+        self.work_offsets = [(0.0, 0.0, 0.0)] * 6
 
-    def set_plane(self, gcode):
-        """
-        Set active arc plane.
-        """
-        if gcode == "G17":
-            self.plane = Plane.XY
-        elif gcode == "G18":
-            self.plane = Plane.XZ
-        elif gcode == "G19":
-            self.plane = Plane.YZ
+        # Arc + segmentation knobs (in mm / seconds)
+        self.arc_tolerance = 0.025
+        self.max_arc_segment_length = 1.0
+        self.max_core_segment_length = 2.0
+        self.max_segment_time = 0.01
+
+        # A safe default rapid rate if none provided elsewhere (mm/min)
+        self.rapid_feedrate = 3000.0
 
     def set_distance_mode(self, gcode):
-        """
-        Set distance mode (absolute or incremental).
-        """
-        self.absolute = (gcode == "G90")
+        if gcode == "G90":
+            self.absolute = True
+        elif gcode == "G91":
+            self.absolute = False
+
+    def set_units(self, gcode):
+        if gcode == "G21":
+            self.units = "mm"
+            self.units_scale = 1.0
+        elif gcode == "G20":
+            self.units = "in"
+            self.units_scale = 25.4
+
+    def set_plane(self, gcode):
+        if gcode in ("G17", "G18", "G19"):
+            self.plane = gcode
+
+    def set_motion_mode(self, motion_mode):
+        self.motion_mode = motion_mode
 
     def update_feedrate(self, f):
-        """
-        Update feedrate, applying unit scaling.
-        """
-        self.feedrate = f * self.units_scale
+        # G-code feedrate is in current units/min. Convert to mm/min.
+        if f is None:
+            return
+        self.feedrate = float(f) * self.units_scale
 
-    def resolve_target(self, target):
+    def resolve_target(self, target_words):
         """
-        Convert a G-code target dictionary into absolute coordinates.
-
-        Takes into account:
-        - Distance mode (absolute vs incremental)
-        - Active unit scaling
-        - Current position
-
-        :param target: dict like {"X": 10, "Y": 5}
-        :return: Absolute (x, y, z) position tuple
+        Resolve X/Y/Z targets in program space (mm).
+        Applies units scaling and absolute/incremental mode.
+        Does NOT apply WCS offsets.
         """
         resolved = list(self.position)
-
-        for i, axis in enumerate(("X", "Y", "Z")):
-            if axis in target:
-                value = target[axis] * self.units_scale
-                if self.absolute:
-                    resolved[i] = value + self.work_offset[i]
-                else:
-                    resolved[i] += value
-
-        return tuple(resolved)
-
-
-class Plane:
-    """
-    Enumeration of CNC motion planes.
-    """
-    XY = "G17"
-    XZ = "G18"
-    YZ = "G19"
+        for axis, idx in (("X", 0), ("Y", 1), ("Z", 2)):
+            if axis not in target_words:
+                continue
+            val_mm = float(target_words[axis]) * self.units_scale
+            if self.absolute:
+                resolved[idx] = val_mm
+            else:
+                resolved[idx] += val_mm
+        return resolved

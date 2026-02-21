@@ -1,253 +1,204 @@
 # klippy/extras/cnc/interpreter.py
 
-from primitives import MotionPrimitive, MotionType
-from arc import segment_arc, compute_arc_center_from_r
-from limits import SoftLimits, SoftLimitError
-from linear import segment_linear
+import math
+
+try:
+    from .primitives import MotionPrimitive, MotionType
+    from .arc import segment_arc, compute_arc_center_from_r
+    from .linear import segment_linear
+    from .limits import SoftLimitError
+except ImportError:
+    from primitives import MotionPrimitive, MotionType
+    from arc import segment_arc, compute_arc_center_from_r
+    from linear import segment_linear
+    from limits import SoftLimitError
 
 
 class CNCInterpreter:
     """
-    CNC G-code interpreter.
-
-    This class converts parsed G-code words into motion primitives
-    while updating and respecting CNC modal state.
-
-    Responsibilities:
-    - Update modal state (motion mode, units, plane, feedrate, etc.)
-    - Resolve target positions
-    - Generate linear and arc motion primitives
-    - Apply work coordinate offsets
-    - Enforce segmentation constraints
+    Convert parsed G-code dict -> list[MotionPrimitive], while updating modal state.
     """
 
     def __init__(self, modal_state, soft_limits=None):
-        # Modal CNC state (shared across G-code lines)
         self.state = modal_state
-
-        # Optional software travel limits
         self.soft_limits = soft_limits
 
-    def apply_work_offset(self, position):
-        """
-        Apply the active work coordinate system offset.
-
-        Converts program-space coordinates into machine-space
-        coordinates by adding the active WCS offset.
-        """
+    def apply_work_offset(self, position_mm):
         ox, oy, oz = self.state.work_offsets[self.state.active_wcs]
-        return (
-            position[0] + ox,
-            position[1] + oy,
-            position[2] + oz,
-        )
+        return (position_mm[0] + ox, position_mm[1] + oy, position_mm[2] + oz)
 
     def interpret(self, parsed):
-        """
-        Interpret parsed G-code data and return motion primitives.
-
-        Input format:
-        {
-            "words": { "X": 1.0, "Y": 2.0, ... },
-            "gcodes": [0, 1, ...],
-            "mcodes": [3, 5, ...],
-        }
-
-        Returns:
-        - A list of MotionPrimitive objects
-        """
         if not parsed:
             return []
 
-        import math
+        words = parsed.get("words", {})
+        gcodes = parsed.get("gcodes", [])
 
-        primitives = []
-        target = {}
-
-        words = parsed["words"]
-        gcodes = parsed["gcodes"]
-
-        # --- Handle G-codes first (modal updates) ---
-        # These affect how the rest of the line is interpreted
+        # Modal updates first
         for g in gcodes:
             self._handle_g(g)
 
-        # --- Handle axis words / feedrate ---
-        for letter, value in words.items():
-            if letter in ("X", "Y", "Z", "I", "J", "K", "R"):
-                # Axis and arc geometry words
-                target[letter] = value
-            elif letter == "F":
-                # Feedrate update (modal)
-                self.state.update_feedrate(value)
+        # Feedrate update
+        if "F" in words:
+            self.state.update_feedrate(words["F"])
 
-        # --- Generate motion primitives ---
+        # Collect motion words
+        target = {}
+        for k in ("X", "Y", "Z", "I", "J", "K", "R"):
+            if k in words:
+                target[k] = words[k]
 
-            # Program-space start and end positions
-            start_prog = tuple(self.state.position)
-            end_prog = self.state.resolve_target(target)
+        motion = self.state.motion_mode
 
-            # Apply work coordinate offset (program → machine space)
-            start = self.apply_work_offset(start_prog)
-            end = self.apply_work_offset(end_prog)
+        # If no XYZ target and not arc geometry, nothing to do
+        if not any(k in target for k in ("X", "Y", "Z")) and motion not in (MotionType.ARC_CW, MotionType.ARC_CCW):
+            return []
 
-        # ---------------- ARC MOTION ----------------
-            if self.state.motion_mode in (MotionType.ARC_CW, MotionType.ARC_CCW):
-                plane = self.state.plane
-                pos = start
+        # Resolve program-space endpoints (mm) and update program position
+        start_prog = tuple(self.state.position)
+        end_prog = tuple(self.state.resolve_target(target))
+        self.state.position = list(end_prog)
 
-                # Plane → axis mapping
-                # ax, ay: arc plane axes
-                # az: perpendicular axis (for helical motion)
-                if plane == "G17":  # XY plane
-                    ax, ay, az = 0, 1, 2
-                    ia, ib = "I", "J"
-                elif plane == "G18":  # XZ plane
-                    ax, ay, az = 0, 2, 1
-                    ia, ib = "I", "K"
-                elif plane == "G19":  # YZ plane
-                    ax, ay, az = 1, 2, 0
-                    ia, ib = "J", "K"
-                else:
-                    raise RuntimeError(f"Unsupported plane {plane}")
+        # Convert to machine-space (apply WCS)
+        start = self.apply_work_offset(start_prog)
+        end = self.apply_work_offset(end_prog)
 
-                a0, b0 = pos[ax], pos[ay]
-                a1, b1 = end[ax], end[ay]
+        # Optional: bounds check final endpoint
+        if self.soft_limits is not None:
+            self.soft_limits.check_point(end)  # may raise SoftLimitError
 
-                # --- Determine arc center ---
-                if "R" in target:
-                    # R-format arc definition
-                    from arc import compute_arc_center_from_r
-                    center = compute_arc_center_from_r(
-                        start=(a0, b0),
-                        end=(a1, b1),
-                        r=target["R"] * self.state.units_scale,
-                        clockwise=(self.state.motion_mode == MotionType.ARC_CW),
-                    )
-                else:
-                    # I/J/K offset format
-                    ia_val = target.get(ia, 0.0) * self.state.units_scale
-                    ib_val = target.get(ib, 0.0) * self.state.units_scale
-                    center = (a0 + ia_val, b0 + ib_val)
+        # Dispatch motion
+        if motion in (MotionType.ARC_CW, MotionType.ARC_CCW):
+            return self._interp_arc(motion, start_prog, end_prog, target)
+        else:
+            return self._interp_linear(motion, start, end)
 
-                # --- Segment arc in the active plane ---
-                points = segment_arc(
-                    start=(a0, b0),
-                    end=(a1, b1),
-                    center=center,
-                    clockwise=(self.state.motion_mode == MotionType.ARC_CW),
-                    tolerance=self.state.arc_tolerance,
-                )
+    def _interp_linear(self, motion, start, end):
+        # Choose feedrate
+        if motion == MotionType.RAPID:
+            feed = self.state.rapid_feedrate
+        else:
+            feed = self.state.feedrate
+            if feed is None:
+                raise ValueError("Feedrate not set (missing F...) for G1/G2/G3 motion")
 
-                # --- Compute total arc length (planar + helical) ---
-                xy_len = 0.0
-                for i in range(len(points) - 1):
-                    dx = points[i + 1][0] - points[i][0]
-                    dy = points[i + 1][1] - points[i][1]
-                    xy_len += math.hypot(dx, dy)
+        segs = segment_linear(start, end, feed, self.state.max_segment_time)
+        prims = []
+        for s0, s1 in segs:
+            prims.append(MotionPrimitive(motion, tuple(s0), tuple(s1), feed))
+        return prims
 
-                z0 = pos[az]
-                z1 = end[az]
-                dz_total = z1 - z0
+    def _interp_arc(self, motion, start_prog, end_prog, target):
+        clockwise = (motion == MotionType.ARC_CW)
+        plane = self.state.plane
 
-                total_len = math.hypot(xy_len, dz_total)
+        # Plane axis mapping: (a,b) is arc plane, c is perpendicular axis
+        if plane == "G17":      # XY, Z perpendicular
+            ax, ay, az = 0, 1, 2
+        elif plane == "G18":    # XZ, Y perpendicular
+            ax, ay, az = 0, 2, 1
+        elif plane == "G19":    # YZ, X perpendicular
+            ax, ay, az = 1, 2, 0
+        else:
+            raise ValueError(f"Unsupported plane: {plane}")
 
-                prev = start
-                traveled_xy = 0.0
+        s2 = (start_prog[ax], start_prog[ay])
+        e2 = (end_prog[ax], end_prog[ay])
 
-                for i, (a, b) in enumerate(points):
-                    next_pt = list(prev)
-                    next_pt[ax] = a
-                    next_pt[ay] = b
+        # Center from R or IJK
+        scale = self.state.units_scale
+        if "R" in target:
+            r = float(target["R"]) * scale
+            center = compute_arc_center_from_r(s2, e2, r, clockwise)
+        else:
+            # IJK are offsets in the fixed XYZ axes, regardless of plane
+            i = float(target.get("I", 0.0)) * scale
+            j = float(target.get("J", 0.0)) * scale
+            k = float(target.get("K", 0.0)) * scale
+            if plane == "G17":
+                center = (s2[0] + i, s2[1] + j)
+            elif plane == "G18":
+                center = (s2[0] + i, s2[1] + k)
+            else:  # G19
+                center = (s2[0] + j, s2[1] + k)
 
-                    # --- Helical Z interpolation ---
-                    if xy_len > 0:
-                        if i > 0:
-                            dx = a - points[i - 1][0]
-                            dy = b - points[i - 1][1]
-                            traveled_xy += math.hypot(dx, dy)
-                        frac = traveled_xy / xy_len
-                    else:
-                        frac = 1.0
+        points = segment_arc(
+            start=s2,
+            end=e2,
+            center=center,
+            clockwise=clockwise,
+            tolerance=self.state.arc_tolerance,
+        )
 
-                    next_pt[az] = z0 + dz_total * frac
+        # Helix interpolation on perpendicular axis
+        delta_perp = end_prog[az] - start_prog[az]
 
-                    # --- Segment length ---
-                    seg_len = math.dist(prev, next_pt)
+        # Total XY/XZ/YZ length for proper helix fraction
+        total_len = 0.0
+        prev2 = s2
+        for p in points:
+            total_len += math.hypot(p[0] - prev2[0], p[1] - prev2[1])
+            prev2 = p
+        if total_len <= 1e-12:
+            return []
 
-                    # --- Arc feedrate correction ---
-                    # Currently uses modal feedrate directly
-                    seg_feed = self.state.feedrate
+        prims = []
+        prev_prog = list(start_prog)
+        prev_machine = list(self.apply_work_offset(prev_prog))
 
-                    primitives.append(
-                        MotionPrimitive(
-                            motion=MotionType.LINEAR,
-                            start=prev,
-                            end=tuple(next_pt),
-                            feedrate=seg_feed,
-                        )
-                    )
+        traveled = 0.0
+        prev2 = s2
+        for p in points:
+            seg_len = math.hypot(p[0] - prev2[0], p[1] - prev2[1])
+            traveled += seg_len
+            frac = min(1.0, traveled / total_len)
 
-                    prev = tuple(next_pt)
+            next_prog = list(prev_prog)
+            next_prog[ax] = p[0]
+            next_prog[ay] = p[1]
+            next_prog[az] = start_prog[az] + delta_perp * frac
 
-            # ---------------- LINEAR / RAPID ----------------
-            else:
-                # Segment linear motion based on max segment time
-                segments = segment_linear(
-                    start=start,
-                    end=end,
-                    feedrate=self.state.feedrate,
-                    max_segment_time=self.state.max_segment_time,
-                )
+            next_machine = list(self.apply_work_offset(next_prog))
 
-                for seg_start, seg_end in segments:
-                    primitives.append(
-                        MotionPrimitive(
-                            motion=self.state.motion_mode,
-                            start=seg_start,
-                            end=seg_end,
-                            feedrate=self.state.feedrate,
-                        )
-                    )
+            # For segmented arcs, emit linear primitives (your planner handles smoothing)
+            feed = self.state.feedrate
+            if feed is None:
+                raise ValueError("Feedrate not set (missing F...) for G2/G3 motion")
+            prims.append(MotionPrimitive(MotionType.LINEAR, tuple(prev_machine), tuple(next_machine), feed))
 
-    def _handle_g(self, gcode):
-        """
-        Handle modal G-code updates.
-        """
-        if gcode in (0, 1):
-            # Rapid (G0) or linear feed (G1)
-            self.state.motion_mode = (
-                MotionType.RAPID if gcode == 0 else MotionType.LINEAR
-            )
+            prev_prog = next_prog
+            prev_machine = next_machine
+            prev2 = p
 
-        elif gcode in (2, 3):
-            # Clockwise / counter-clockwise arc
-            self.state.motion_mode = (
-                MotionType.ARC_CW if gcode == 2 else MotionType.ARC_CCW
-            )
+        return prims
 
-        elif gcode in (90, 91):
-            # Absolute / incremental distance mode
-            self.state.set_distance_mode(f"G{gcode}")
+    def _handle_g(self, gcode_num):
+        # Motion modes
+        if gcode_num == 0:
+            self.state.set_motion_mode(MotionType.RAPID)
+        elif gcode_num == 1:
+            self.state.set_motion_mode(MotionType.LINEAR)
+        elif gcode_num == 2:
+            self.state.set_motion_mode(MotionType.ARC_CW)
+        elif gcode_num == 3:
+            self.state.set_motion_mode(MotionType.ARC_CCW)
 
-        elif gcode in (20, 21):
-            # Inches / millimeters
-            self.state.set_units(f"G{gcode}")
+        # Distance mode
+        elif gcode_num == 90:
+            self.state.set_distance_mode("G90")
+        elif gcode_num == 91:
+            self.state.set_distance_mode("G91")
 
-        elif gcode in (17, 18, 19):
-            # Active plane selection
-            self.state.set_plane(f"G{gcode}")
+        # Units
+        elif gcode_num == 20:
+            self.state.set_units("G20")
+        elif gcode_num == 21:
+            self.state.set_units("G21")
 
+        # Plane
+        elif gcode_num in (17, 18, 19):
+            self.state.set_plane(f"G{gcode_num}")
 
-def test_linear_segmentation_time_bound():
-    """
-    Simple sanity test to verify time-based segmentation.
-    """
-    segs = segment_linear(
-        (0,0,0), (100,0,0), feedrate=600, max_segment_time=0.1
-    )
-    assert len(segs) >= 10
-    return segs
-
-
-print(test_linear_segmentation_time_bound())
+        # WCS selection (G54..G59)
+        elif 54 <= gcode_num <= 59:
+            self.state.active_wcs = gcode_num - 54

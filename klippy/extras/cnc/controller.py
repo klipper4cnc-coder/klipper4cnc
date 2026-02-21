@@ -2,10 +2,15 @@
 
 from enum import Enum
 from collections import deque
-from parser import parse_gcode_line
+
 
 # New: streaming planner (raw MotionPrimitive -> PlannedPrimitive)
-from planner import CNCPlanner, PlannedPrimitive
+try:
+    from .parser import parse_gcode_line
+    from .planner import CNCPlanner, PlannedPrimitive
+except ImportError:
+    from parser import parse_gcode_line
+    from planner import CNCPlanner, PlannedPrimitive
 
 
 def format_time(seconds):
@@ -179,6 +184,68 @@ class CNCController:
         finally:
             streamer.close()
             print("[DBG] streamer closed")
+
+    def pump(self, streamer, interpreter, max_lines=50, max_steps=20):
+        """
+        Incremental execution: read <= max_lines, then execute <= max_steps.
+        Safe to call from a reactor timer callback.
+        """
+        lines_read = 0
+        steps = 0
+
+        # Fill lookahead / ready queue
+        if self.planner is None:
+            # Legacy raw-buffer mode
+            while (not self.eof
+                   and len(self.buffer) < self.lookahead_size
+                   and lines_read < max_lines):
+                line = streamer.next_line()
+                if line is None:
+                    self.eof = True
+                    break
+                parsed = parse_gcode_line(line)
+                prims = interpreter.interpret(parsed)
+                for p in prims:
+                    self.buffer.append(p)
+                lines_read += 1
+        else:
+            # Planned mode
+            while (not self.eof
+                   and len(self.ready_queue) < self.lookahead_size
+                   and lines_read < max_lines):
+                line = streamer.next_line()
+                if line is None:
+                    self.eof = True
+                    # Flush remaining planned moves
+                    self.ready_queue.extend(self.planner.finish())
+                    break
+
+                parsed = parse_gcode_line(line)
+                prims = interpreter.interpret(parsed)
+                for p in prims:
+                    committed = self.planner.push(p)
+                    if committed:
+                        self.ready_queue.extend(committed)
+                lines_read += 1
+
+        # Execute a few steps if RUNNING
+        if self.state == ControllerState.RUNNING and max_steps > 0:
+            while steps < max_steps:
+                did = self.step()
+                if not did:
+                    break
+                steps += 1
+
+        return lines_read, steps
+
+    def is_done(self):
+        """
+        True when the input is exhausted and there's no more internal work to execute.
+        Does not account for toolhead buffering (the runner handles draining).
+        """
+        if self.planner is None:
+            return self.eof and not self.buffer
+        return self.eof and not self.ready_queue
 
     # -------------------------
     # Control commands
