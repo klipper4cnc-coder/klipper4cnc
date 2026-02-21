@@ -25,10 +25,11 @@ The streaming execution pipeline is:
 
 1. Prescan (optional, for progress estimation)
 2. Runtime setup
-3. Streaming interpretation
-4. Lookahead buffering
-5. Primitive execution
-6. Completion / shutdown
+3. Controller start
+4. Job runner entry (reactor timer in Klipper)
+5. Lookahead buffering
+6. Primitive execution
+7. Completion / shutdown
 
 Each phase is described in detail below.
 
@@ -68,9 +69,16 @@ Before execution begins:
 2. Apply the same arc tolerance used during prescan
 3. Create a CNCInterpreter using the runtime state
 4. Create a MotionExecutor (KlipperMotionExecutor)
-5. Create a CNCController
-6. Set total_length on the controller (if prescan was performed)
-7. Create a GCodeStreamer for the input file
+5. Create a CNCPlanner (if using planned mode)
+6. Create a CNCController
+7. Set total_length on the controller (if prescan was performed)
+8. Create a GCodeStreamer for the input file
+
+In Klipper runtime (cnc_mode), an additional step occurs:
+
+9. Register a reactor timer that will drive execution incrementally via
+   controller.pump(...). CNC_START schedules the timer and returns immediately
+   so Klipper can continue to process commands (HOLD/RESUME/CANCEL).
 
 At this point:
 - No motion has been executed
@@ -93,42 +101,56 @@ It only enables execution.
 
 ---
 
-## 4. Streaming loop entry
+## 4. Job runner entry (reactor timer)
 
-Execution enters:
+### Klipper runtime (non-blocking)
 
-controller.run_stream(streamer, interpreter)
+In real Klipper, execution is driven by cnc_mode via a reactor timer callback.
 
-The controller:
+1. CNC_START initializes runtime state (streamer/interpreter/planner/controller)
+2. CNC_START calls controller.start() and schedules a reactor timer, then returns
+3. Each timer callback:
+   - Reads a small batch of lines from the streamer
+   - Parses + interprets into MotionPrimitives
+   - Pushes primitives into the planner and fills the ready queue
+   - Executes a small number of primitives via controller.step()
+   - Reschedules itself
 
-1. Opens the streamer
-2. Enters the main execution loop
-3. Continues until:
-   - Job completes
-   - Execution is cancelled
-   - An error is raised
+This keeps the host reactor responsive so CNC_FEED_HOLD / CNC_RESUME / CNC_CANCEL
+can take effect promptly.
+
+### Offline / test tools (blocking)
+
+In offline scripts and unit tests, it is acceptable to drive the controller in a
+blocking loop (e.g. controller.run_stream(...)) because there is no reactor
+responsiveness requirement.
 
 ---
 
 ## 5. Lookahead buffer fill
 
-Inside the main loop, the controller attempts to fill the lookahead buffer.
+Inside the job runner, the controller attempts to fill the lookahead buffer.
 
 For each iteration:
 
 1. Request next line from the streamer
 2. If EOF:
    - Mark eof = True
-   - Stop filling
+   - Stop filling (and finalize planner if applicable)
 3. Otherwise:
    - Parse the G-code line
    - Interpret it into motion primitives
-   - Append primitives to the lookahead buffer
+   - Append primitives to the lookahead buffer (legacy mode) OR
+     push primitives into the planner (planned mode) and append committed
+     PlannedPrimitives into the ready queue
 
 Notes:
 - Modal state is updated during interpretation
 - Buffer size is capped
 - Interpretation and execution are decoupled
+
+In Klipper runtime, cnc_mode also applies backpressure based on toolhead queue
+buffering (avoid queueing too far ahead) so HOLD/CANCEL remain responsive.
 
 ---
 
@@ -140,11 +162,11 @@ Before executing motion, the controller checks state:
   - Exit immediately
 - If not RUNNING (e.g. HOLD):
   - Skip execution
-  - Continue buffer management only
+  - Continue buffer management only (optional, depending on runner policy)
 
 This ensures:
-- Feed hold pauses motion instantly
-- Interpretation does not accidentally advance execution
+- Feed hold pauses motion promptly
+- A job can be cancelled without waiting for a blocking loop to finish
 
 ---
 
@@ -157,8 +179,8 @@ step()
 step() performs:
 
 1. Check controller state (must be RUNNING)
-2. Check lookahead buffer is not empty
-3. Pop one MotionPrimitive
+2. Check lookahead/ready queue is not empty
+3. Pop one MotionPrimitive (or unwrap a PlannedPrimitive)
 4. Validate feedrate resolution
 5. Send primitive to executor.execute()
 6. Update completed_length
@@ -187,17 +209,21 @@ If feedrate is unknown, ETA is reported as "?".
 
 ## 9. End-of-job detection
 
-Execution completes when:
+The controller considers internal execution complete when:
 
 - eof == True
-- AND lookahead buffer is empty
+- AND the lookahead buffer / ready queue is empty
 - AND step() returns False
 
-At this point:
-- All motion primitives have been executed
-- No more G-code remains
+In Klipper runtime, cnc_mode typically adds a "drain" phase:
 
-The controller exits the streaming loop.
+- When the controller reports EOF and internal queues are empty, stop feeding new moves
+- Wait for the toolhead queue to drain (queued motion time approaches 0)
+- Then mark the job complete and stop the reactor timer
+
+At this point:
+- All motion primitives have been executed (from the controller’s perspective)
+- No more G-code remains
 
 ---
 
@@ -206,9 +232,12 @@ The controller exits the streaming loop.
 Finally:
 
 1. The streamer is closed
-2. The executor is flushed
-3. Controller remains in RUNNING or IDLE state
+2. The executor may be flushed (if running in blocking/offline mode)
+3. The controller remains in RUNNING or IDLE state depending on policy
 4. No further motion occurs
+
+In Klipper runtime, avoid blocking waits in the reactor; draining is performed
+by polling toolhead queue state instead of calling wait_moves() inside the timer.
 
 The job is complete.
 
@@ -224,9 +253,9 @@ This transitions:
 - RUNNING -> HOLD
 
 Effects:
-- Execution pauses immediately
+- Execution pauses promptly
 - No further primitives are executed
-- Lookahead buffering may continue
+- Lookahead buffering may continue (runner-dependent)
 
 Resume is performed by:
 
@@ -235,7 +264,7 @@ controller.resume()
 This transitions:
 - HOLD -> RUNNING
 
-Execution continues exactly where it left off.
+Execution continues where it left off.
 
 ---
 
@@ -247,7 +276,6 @@ controller.cancel()
 
 Effects:
 - Controller state becomes CANCELLED
-- Streaming loop exits
 - Execution cannot resume
 - reset() is required to continue
 
@@ -266,11 +294,6 @@ Errors may occur during:
 
 Errors propagate upward and terminate execution.
 
-The controller does not attempt to recover from:
-- Geometry errors
-- Limit violations
-- Unresolved feedrates
-
 Fail-fast behavior is intentional.
 
 ---
@@ -288,6 +311,7 @@ The CNC execution flow is:
 Every executed motion has a clear origin and context.
 
 If you can trace:
-- parse -> interpret -> buffer -> step -> execute
+
+parse -> interpret -> buffer/plan -> step -> execute
 
 you understand the runtime behavior of the system.

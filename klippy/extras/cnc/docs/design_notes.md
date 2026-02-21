@@ -24,6 +24,22 @@ This drives many of the architectural choices below.
 
 ---
 
+## Why execution must be reactor/timer-driven in Klipper
+
+Klipper's host code is reactor-driven. A blocking "run the whole job" loop prevents
+the reactor from servicing other commands while a job is running.
+
+For CNC, this is not acceptable: feed hold, resume, and cancel must be able to take
+effect promptly during motion. Therefore, CNC jobs are executed by a job runner that:
+
+- Runs in small increments from a reactor timer callback
+- Limits toolhead buffering (backpressure) to keep control responsive
+- Transitions to a drain/completion phase at EOF
+
+This constraint is a primary reason streaming-first execution is preferred.
+
+---
+
 ## Streaming-first design
 
 ### Why streaming is the primary execution model
@@ -247,6 +263,7 @@ They are:
 
 They trade:
 - Formal isolation
+
 for:
 - Readability
 - Architectural clarity

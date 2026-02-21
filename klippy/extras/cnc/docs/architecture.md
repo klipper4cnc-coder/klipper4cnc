@@ -17,11 +17,14 @@ pipeline layered on top of Klipper.
 At a high level, CNC execution follows this flow:
 
 G-code source
-  -> parser.py          (syntax -> structured words)
-  -> interpreter.py     (modal state -> motion primitives)
-  -> controller.py      (buffering, execution, progress, control)
-  -> executor.py        (backend abstraction)
-  -> klipper_executor.py (Klipper toolhead moves)
+  -> parser.py            (syntax -> structured words)
+  -> interpreter.py       (modal state -> motion primitives)
+  -> controller.py        (buffering, execution, progress, control)
+  -> executor.py          (backend abstraction)
+  -> klipper_executor.py  (Klipper toolhead moves)
+
+In Klipper runtime, cnc_mode drives the controller via a reactor timer (non-blocking),
+calling controller.pump(...) in small increments so HOLD/RESUME/CANCEL work during jobs.
 
 Two execution modes exist:
 
@@ -119,6 +122,7 @@ Arc motion (G2/G3):
 - Supports helical arcs (simultaneous Z motion)
 
 Arcs are:
+
 - Segmented in the active plane
 - Converted into linear motion primitives
 - Executed as standard linear moves
@@ -134,15 +138,23 @@ CNCController is the execution engine.
 Responsibilities:
 
 - Manage execution state (IDLE / RUNNING / HOLD / CANCELLED)
-- Maintain a lookahead buffer
+- Maintain a lookahead buffer / planned ready queue
 - Step execution one primitive at a time
 - Handle feed hold, resume, reset, and cancel
 - Track progress and ETA
 
 Execution is pull-based:
 
-- The controller calls step()
+- The controller executes via step()
 - Each step executes exactly one primitive
+
+Driving the controller:
+
+- In offline tests / CLI tools, controller.run_stream(...) may be used (blocking)
+- In Klipper runtime, cnc_mode calls controller.pump(...) from a reactor timer (non-blocking)
+
+This separation is intentional: the controller contains the execution logic,
+while cnc_mode controls *when* that logic runs.
 
 ---
 
@@ -171,6 +183,7 @@ MotionExecutor is an abstract interface with:
 - flush()
 
 Executors:
+
 - Do not interpret G-code
 - Do not manage modal state
 - Do not perform lookahead
@@ -180,9 +193,13 @@ Executors:
 ### klipper_executor.py
 
 KlipperMotionExecutor:
+
 - Converts feedrate mm/min -> mm/s
 - Sends absolute moves to Klipper toolhead
 - Flushes motion using wait_moves()
+
+Note: in Klipper reactor-driven execution, avoid calling wait_moves() inside
+the timer loop. A job runner should drain by observing toolhead queue state.
 
 ---
 
@@ -215,7 +232,11 @@ The following files act as executable documentation:
 - test_file.py
 - test_interpreter.py
 - test_modal.py
+- test_jd.py
 - test.nc
+
+(Optionally) add other harnesses here as they appear, such as dry-run and
+reactor-driven integration tests.
 
 ---
 
@@ -243,6 +264,7 @@ The following files act as executable documentation:
 ## Summary
 
 If you understand:
+
 - modal_state.py
 - interpreter.py
 - controller.py

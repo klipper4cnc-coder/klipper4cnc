@@ -13,6 +13,22 @@ This project is focused on correctness, clarity, and long-term maintainability r
 
 ---
 
+## CNC mode runtime behavior (important)
+
+CNC jobs are executed **non-blocking** inside Klipper: `CNC_START` schedules a reactor/timer-driven job runner that incrementally pumps the streaming pipeline (read → interpret → plan → execute). This keeps Klipper responsive so control commands can take effect during motion.
+
+Core control commands:
+
+- `CNC_START FILE=<path>` – start a job (returns immediately; job runs via reactor timer)
+- `CNC_FEED_HOLD` – pause queuing/execution promptly
+- `CNC_RESUME` – continue after hold
+- `CNC_CANCEL` – stop the job (terminal until reset)
+- `CNC_RESET` – clear CNC state after cancel/error
+
+(These commands are evolving as hardware testing ramps up.)
+
+---
+
 ## Why klipper4cnc exists
 
 Klipper is an excellent motion control system, but it is fundamentally **printer-centric**:
@@ -54,12 +70,12 @@ When CNC mode is enabled:
 In CNC mode, G-code is **not executed line-by-line**.
 
 Instead, the pipeline is:
-G-code
-- parsed commands
-- modal interpretation
-- geometric motion primitives
-- time-parameterized execution
 
+G-code  
+→ parsed commands  
+→ modal interpretation  
+→ geometric motion primitives  
+→ execution
 
 This allows:
 - Correct arc handling (G2/G3)
@@ -88,7 +104,7 @@ This makes the system:
 
 ### New CNC subsystem
 A new CNC-specific subsystem lives under:
-- klippy/extras/cnc
+- `klippy/extras/cnc`
 
 This subsystem includes:
 
@@ -123,7 +139,7 @@ CNC programs can be large and arc-heavy.
 klipper4cnc uses a **streaming execution model**:
 - Bounded lookahead
 - Safe cancellation
-- End-of-file–safe draining
+- End-of-file safe draining
 - Continuous progress tracking
 
 ---
